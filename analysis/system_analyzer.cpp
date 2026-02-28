@@ -32,7 +32,6 @@ SystemAnalyzer::Snapshot SystemAnalyzer::analyze(const NBodySystem& system, doub
     return s;
 }
 
-// IMPLEMENTACIÓN QUE FALTABA
 std::vector<BinaryDetector::Binary> SystemAnalyzer::find_binaries(const NBodySystem& system) {
     BinaryDetector detector;
     return detector.detect(system);
