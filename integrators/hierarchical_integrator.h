@@ -1,34 +1,19 @@
-// integrators/hierarchical_integrator.h
 #pragma once
 #include <memory>
 #include <vector>
+#include <map>
+#include <tuple>
 #include "integrator.h"
 #include "hierarchy_node.h"
 #include "hierarchy_builder.h"
 #include "chain3_integrator.h"
+#include "archain3_integrator.h"
+#include "archain3_state.h"
 #include "ks_perturbed_integrator.h"
 #include "ks_integrator.h"
 #include "regime_logger.h"
 #include "nbody_system.h"
 
-// ============================================================================
-// HIERARCHICAL INTEGRATOR — Ruta B
-//
-// Reemplaza HybridIntegrator usando el árbol de HierarchyBuilder.
-//
-// Cada paso:
-//   1. HierarchyBuilder::build() → árbol del instante actual
-//   2. Recorrer el árbol e integrar cada nodo con su método especializado:
-//        LEAF         → far (Leapfrog/RK4)
-//        PAIR_KS      → KS simple o KS perturbado (según tidal_parameter)
-//        TRIPLE_CHAIN → Chain3Integrator
-//        COMPOSITE    → integrar hijos recursivamente
-//
-// Ventajas sobre HybridIntegrator:
-//   - Detección automática de triples
-//   - Clasificación automática KS simple vs perturbado
-//   - Estructura extensible: añadir COMPOSITE anidado en el futuro es trivial
-// ============================================================================
 class HierarchicalIntegrator : public Integrator {
 public:
     HierarchicalIntegrator(
@@ -45,13 +30,18 @@ public:
         const std::vector<bool>& used
     ) override;
 
-    /// Acceso al árbol del último paso (útil para tests y diagnóstico)
     const HierarchyNode* last_tree() const { return last_root.get(); }
 
 private:
-    // -----------------------------------------------------------------------
-    // INTEGRACIÓN POR TIPO DE NODO
-    // -----------------------------------------------------------------------
+    using TripleKey = std::tuple<int,int,int>;
+
+    static TripleKey make_key(int i, int j, int k) {
+        int a = i, b = j, c = k;
+        if (a > b) std::swap(a, b);
+        if (b > c) std::swap(b, c);
+        if (a > b) std::swap(a, b);
+        return {a, b, c};
+    }
 
     void integrate_node(
         HierarchyNode& node,
@@ -79,6 +69,12 @@ private:
         double dt
     );
 
+    void integrate_triple_ar_chain(
+        HierarchyNode& node,
+        NBodySystem& system,
+        double dt
+    );
+
     void integrate_composite(
         HierarchyNode& node,
         NBodySystem& system,
@@ -86,17 +82,22 @@ private:
         std::vector<bool>& in_subsystem
     );
 
-    // -----------------------------------------------------------------------
-    // MIEMBROS
-    // -----------------------------------------------------------------------
+    void collect_active_ar_keys(
+        const HierarchyNode& node,
+        std::vector<TripleKey>& keys
+    ) const;
+
     std::unique_ptr<Integrator>   far;
     KSIntegrator                  ks_simple;
     KSPerturbedIntegrator         ks_perturbed;
     Chain3Integrator              chain3;
+    ARChain3Integrator            ar_chain_;
     HierarchyBuilder              builder;
     double                        tidal_threshold;
     RegimeLogger*                 logger;
     std::size_t                   step_counter = 0;
 
-    std::unique_ptr<HierarchyNode> last_root;  ///< Árbol del último paso
+    std::unique_ptr<HierarchyNode> last_root;
+
+    std::map<TripleKey, ARChain3State> ar_chain_states_;
 };
