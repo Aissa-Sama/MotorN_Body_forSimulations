@@ -50,9 +50,10 @@ public:
 
     double energy_error(const ARChainNState& state, double E_ref) const;
 
-private:
-    BSParameters params_;
+protected:
+    BSParameters params_;  ///< Accesible a subclases (ARChainNKSIntegrator).
 
+private:
     static constexpr int K_MAX = 8;
     static constexpr std::array<int, K_MAX> n_seq_ = {2, 4, 6, 8, 10, 12, 14, 16};
 
