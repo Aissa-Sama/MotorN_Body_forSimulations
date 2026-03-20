@@ -205,7 +205,6 @@ inline void compute_PN2(const std::vector<Vec3>& r,
             const double vivj = dot(v[i], v[j]);
             const double vi_n = dot(v[i], nij);
             const double vj_n = dot(v[j], nij);
-            const double dv_n = dot(dv, nij);
 
             // Coeficiente de n̂ᵢⱼ
             double cn =
@@ -233,27 +232,35 @@ inline void compute_PN2(const std::vector<Vec3>& r,
 }
 
 // ============================================================================
-// PN2.5 — Reacción de radiación (Burke-Thorne 1971, Peters 1964)
+// PN2.5 — Reacción de radiación de ondas gravitacionales
 //
-// Forma por pares (aproximación estándar para N-body):
+// Forma canónica de Blanchet & Iyer (1993) / Iyer & Will (1995), en G=1.
+// Esta forma funciona tanto para órbitas circulares como excéntricas porque
+// usa vᵢ·n̂ y vⱼ·n̂ de forma INDEPENDIENTE (no solo (vᵢ−vⱼ)·n̂).
 //
-//   a_PN25_i = (1/c⁵) × Σⱼ≠ᵢ (8/5) × (mⱼ/rᵢⱼ²) × {
-//     -(vᵢ−vⱼ)·n̂ × [(17/3)mⱼ/rᵢⱼ × n̂ + (3mᵢ/rᵢⱼ + mⱼ/rᵢⱼ) × (vᵢ−vⱼ)]
-//     + n̂ × [mᵢmⱼ/rᵢⱼ² × (some_coeff)]
+// Para el par (i,j), contribución sobre el cuerpo i, con n̂ᵢⱼ = (rᵢ−rⱼ)/rᵢⱼ:
+//
+//   a_PN25_i += -(8/15) × (mᵢmⱼ/c⁵rᵢⱼ³) × {
+//     n̂ × [(17mⱼ/3 + 3mᵢ)/rᵢⱼ × ṙᵢⱼ − (3/2)(v²_rel − ṙ²ᵢⱼ) × ṙᵢⱼ]
+//     + (vᵢ−vⱼ) × [(mᵢ+mⱼ)/rᵢⱼ − (1/2)ṙ²ᵢⱼ]
 //   }
 //
-// Usando la forma explícita de Peters (1964) para el par (i,j):
-//   La fuerza de reacción actúa en la dirección de la velocidad relativa
-//   y la dirección radial. Solo depende del par → se suma sobre todos los pares.
+// donde:
+//   ṙᵢⱼ = (vᵢ−vⱼ)·n̂ᵢⱼ   (velocidad radial relativa, = 0 para circular)
+//   v²_rel = |vᵢ−vⱼ|²    (módulo cuadrado de velocidad relativa, ≠ 0 para circular)
 //
-// Forma canónica (Mikkola & Merritt 2008, apéndice):
+// Para órbita CIRCULAR: ṙ=0 → la fuerza actúa solo a través del término (vᵢ−vⱼ),
+// que es la velocidad relativa tangencial. Esto produce decay de la órbita circular.
 //
-//   F_PN25_ij/mᵢ = (8/15) × (mⱼ/r²ᵢⱼ) × (1/c⁵) × {
-//     −n̂ × [(vᵢ−vⱼ)·n̂ × (17mⱼ/3rᵢⱼ + 3mᵢ/rᵢⱼ)]
-//     + (vᵢ−vⱼ) × [−(mᵢ + mⱼ)/rᵢⱼ + (vᵢ−vⱼ)·n̂ × ...]
-//   }
+// Para órbita EXCÉNTRICA: ambos términos contribuyen.
 //
-// Implementamos la versión de Blanchet et al. (1995) ec. (7.8):
+// REFERENCIA:
+//   Iyer & Will (1995), Phys. Rev. D 52, 6882 — ec. (4.5)
+//   Peters (1964), Phys. Rev. 136, B1224 — fórmula original
+//   Mikkola & Merritt (2008), AJ 135, 2398 — uso en AR-CHAIN
+//
+// NOTA: PN2.5 es DISIPATIVO. Solo usar con GBS (MMP). El leapfrog simpléctico
+// no puede manejar fuerzas que rompen la estructura Hamiltoniana.
 // ============================================================================
 inline void compute_PN25(const std::vector<Vec3>& r,
                          const std::vector<Vec3>& v,
@@ -271,29 +278,27 @@ inline void compute_PN25(const std::vector<Vec3>& r,
             const Vec3   dr   = r[i] - r[j];
             const double rij  = dr.norm();
             if (rij < 1e-30) continue;
-            const Vec3   nij  = dr * (1.0 / rij);
-            const double r2   = rij * rij;
+            const Vec3   nij  = dr * (1.0 / rij);   // n̂ᵢⱼ: de j hacia i
 
-            const Vec3   dv   = v[i] - v[j];
-            const double dv_n = dot(dv, nij);   // (vᵢ−vⱼ)·n̂
-            const double v2dv = dot(dv, dv);
+            const Vec3   dv   = v[i] - v[j];        // vᵢ − vⱼ
+            const double rdot = dot(dv, nij);        // ṙᵢⱼ = (vᵢ−vⱼ)·n̂ᵢⱼ
+            const double v2   = dot(dv, dv);         // |vᵢ−vⱼ|²
 
             const double mi_r = m[i] / rij;
             const double mj_r = m[j] / rij;
 
-            // Forma de Blanchet et al. (1995), ec. (7.8):
-            // a_PN25_ij = (8/5)(mⱼ/r²)(1/c⁵) × {
-            //   nij × dv_n × [-3mᵢ/r - 17mⱼ/(3r)]
-            //   + dv × [mᵢ/r + mⱼ/r]
-            // } × dv_n
-            // ...simplificado para la aceleración relativa del cuerpo i:
-            const double fac = (8.0/5.0) * m[j] / r2 * inv_c5;
+            // Coeficiente del término n̂ × ṙ (activo solo con ṙ ≠ 0, excéntrica)
+            const double cn  = ((17.0/3.0)*mj_r + 3.0*mi_r) * rdot
+                              - 1.5*(v2 - rdot*rdot) * rdot;
 
-            const double cn  = dv_n * (-3.0*mi_r - (17.0/3.0)*mj_r);
-            const double cdv = mi_r + mj_r;
+            // Coeficiente del término (vᵢ−vⱼ) (activo para circular Y excéntrica)
+            const double cdv = (mi_r + mj_r) - 0.5*rdot*rdot;
+
+            // Prefactor: -(8/15) × mᵢmⱼ/(c⁵rᵢⱼ³)
+            const double fac = -(8.0/15.0) * m[i]*m[j] / (rij*rij*rij) * inv_c5;
 
             a_pn25[i] = a_pn25[i]
-                + (nij * cn + dv * cdv) * (fac * dv_n);
+                + (nij * cn + dv * cdv) * fac;
         }
     }
 }
