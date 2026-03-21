@@ -5,6 +5,7 @@
 #define _USE_MATH_DEFINES
 #include "hierarchical_integrator.h"
 #include "binary_state.h"
+#include "block_timestep.h"  // FASE 7B
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -17,7 +18,9 @@ HierarchicalIntegrator::HierarchicalIntegrator(
     double r_ks_threshold,
     double ks_internal_dt,
     const HierarchyBuilder::Params& builder_params,
-    RegimeLogger* logger_
+    RegimeLogger* logger_,
+    bool enable_block_ts,
+    const BlockTimestep::Params& bt_params
 )
     : far(std::move(far_integrator))
     , ks_simple(ks_internal_dt)
@@ -31,6 +34,10 @@ HierarchicalIntegrator::HierarchicalIntegrator(
     , ar_chain_ks_(builder_params.ar_chain_eta)   // FASE 7A
 {
     (void)r_ks_threshold;
+
+    // FASE 7B
+    if (enable_block_ts)
+        block_ts_ = std::make_unique<BlockTimestep>(bt_params);
 
     if (builder_params.pn.enabled) {
         ARChainNPNBSIntegrator::BSParameters bs;
@@ -57,7 +64,24 @@ void HierarchicalIntegrator::step(
     std::vector<bool> in_subsystem(N, false);
     last_root = builder.build(system, &pn_cache_);
     integrate_node(*last_root, system, dt, in_subsystem);
-    far->step(system, dt, in_subsystem);
+
+    // FASE 7B: block timestep para cuerpos de campo (LEAFs)
+    // Los subsistemas regularizados (PAIR_KS, GROUP_AR_CHAIN) ya tienen
+    // control de paso interno — solo los LEAFs usan dt individual.
+    if (block_ts_) {
+        auto accs  = system.compute_accelerations();
+        auto jerks = BlockTimestep::compute_jerks(system, accs);
+        auto dts   = block_ts_->assign(system, accs, jerks, in_subsystem, dt);
+        // Usar step_block si el far integrator es LeapfrogIntegrator
+        auto* lf = dynamic_cast<LeapfrogIntegrator*>(far.get());
+        if (lf) {
+            lf->step_block(system, dts, in_subsystem);
+        } else {
+            far->step(system, dt, in_subsystem);  // fallback
+        }
+    } else {
+        far->step(system, dt, in_subsystem);
+    }
     ++step_counter;
 }
 
