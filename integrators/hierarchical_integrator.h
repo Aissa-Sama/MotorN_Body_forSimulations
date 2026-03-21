@@ -1,137 +1,181 @@
 // integrators/hierarchical_integrator.h
-// FASE 6A: ARChainNPNBSIntegrator con activación automática PN.
-// FASE 6C: step_to() — integra hasta t_final con callback por paso.
-// FASE 7A: GROUP_AR_CHAIN — N >= 2 cuerpos en AR-chain (cuadruples, quintuples).
 #pragma once
-#define _USE_MATH_DEFINES
-#include <functional>
 #include <memory>
 #include <vector>
 #include <map>
-#include <string>
 #include <tuple>
+#include <functional>
 #include "integrator.h"
 #include "hierarchy_node.h"
 #include "hierarchy_builder.h"
 #include "chain3_integrator.h"
 #include "archain3_integrator.h"
 #include "archain3_state.h"
+#include "archain_n_ks_integrator.h"
 #include "ks_perturbed_integrator.h"
 #include "ks_integrator.h"
 #include "regime_logger.h"
 #include "nbody_system.h"
+#include "block_timestep.h"    // Fase 7B
+#include "merger_engine.h"     // Fase 7C
 
-#include "../regularization/chain/archain_n_state.h"
-#include "../regularization/chain/archain_n_pn_bs_integrator.h"
-// FASE 7A
-#include "../regularization/chain/archain_n_ks_integrator.h"
-// FASE 7B
-#include "block_timestep.h"
-#include "leapfrog_integrator.h"
+// ============================================================================
+// HIERARCHICAL INTEGRATOR — Ruta B
+//
+// Cada paso:
+//   0. [Fase 7C] MergerEngine detecta y ejecuta fusiones/TDEs (opcional)
+//   1. HierarchyBuilder::build() → árbol del instante actual
+//   2. Recorrer el árbol e integrar cada nodo con su método especializado:
+//        LEAF             → far (Leapfrog) [con block timestep si activo]
+//        PAIR_KS          → KS simple o KS perturbado (tidal_parameter)
+//        TRIPLE_CHAIN     → Chain3Integrator  (sep ≥ ar_chain_threshold)
+//        GROUP_AR_CHAIN   → ARChainNKSIntegrator (sep < ar_chain_threshold)
+//        COMPOSITE        → integrar hijos recursivamente
+//
+// ── FASES ACUMULADAS ─────────────────────────────────────────────────────────
+//
+// Fase 6A: HierarchyBuilder marca pn_active; despacho a ARChainNPNBSIntegrator.
+// Fase 6B: ARChainNKSIntegrator con paso ds_ks = η·√(sep·r_ks)/Ω.
+// Fase 7A: GROUP_AR_CHAIN para N≥3 (fusión de TRIPLE_AR_CHAIN).
+// Fase 7B: block_timestep_ — dt individual por cuerpo LEAF (Aarseth 2003).
+// Fase 7C: merger_engine_ — fusiones físicas, TDE, captura Schwarzschild.
+//
+// ── MODOS DE OPERACIÓN ───────────────────────────────────────────────────────
+//
+// 1. step(system, dt) — modo bloque: avanza dt. Uso general, N > 3 o mixto.
+// 2. step_to(system, t_final) — modo directo: sin cortes externos.
+//    Delega a ARChainNKSIntegrator::integrate_to() si el árbol es un único
+//    GROUP_AR_CHAIN. Más preciso para sistemas totalmente acoplados.
+//
+// ── PERSISTENCIA DEL ESTADO AR-CHAIN ─────────────────────────────────────────
+// ar_chain_n_states_: map<string, ARChainNState> indexado por clave canónica
+// (índices ordenados, concatenados como "i_j_k_...").
+// El estado persiste entre pasos para sobrevivir reconstrucciones del árbol.
+// ============================================================================
 
 class HierarchicalIntegrator : public Integrator {
 public:
+
     HierarchicalIntegrator(
-        std::unique_ptr<Integrator> far_integrator,
-        double r_ks_threshold,
-        double ks_internal_dt,
-        const HierarchyBuilder::Params& builder_params = HierarchyBuilder::Params{},
-        RegimeLogger* logger = nullptr,
-        bool enable_block_ts = false,
-        const BlockTimestep::Params& bt_params = BlockTimestep::Params{}
+        std::unique_ptr<Integrator>     far_integrator,
+        double                          r_ks_threshold,
+        double                          ks_internal_dt,
+        const HierarchyBuilder::Params& builder_params  = HierarchyBuilder::Params{},
+        RegimeLogger*                   logger           = nullptr,
+        // Fase 7B — block timestep
+        bool                            enable_block_ts  = false,
+        const BlockTimestep::Params&    bt_params        = BlockTimestep::Params{},
+        // Fase 7C — merger engine
+        bool                            enable_mergers   = false,
+        const tidal::MergerEngine::Params& merger_params = tidal::MergerEngine::Params{}
     );
 
+    // ── Interfaz principal ───────────────────────────────────────────────────
+
+    /** Modo bloque: avanza dt. Uso general. */
     void step(
-        NBodySystem& system,
-        double dt,
-        const std::vector<bool>& used
+        NBodySystem&              system,
+        double                    dt,
+        const std::vector<bool>&  used
     ) override;
 
+    /**
+     * Modo directo: integra de t=0 a t_final sin cortes externos.
+     * Si el árbol entero es un único GROUP_AR_CHAIN, delega directamente
+     * a ARChainNKSIntegrator::integrate_to().
+     */
     void step_to(
-        NBodySystem& system,
-        double t_final,
-        double dt_hint,
-        std::function<void(double)> on_step = nullptr
+        NBodySystem&                    system,
+        double                          t_final,
+        std::function<void(double)>     logger_cb = nullptr
     );
 
-    void step_to(
-        NBodySystem& system,
-        double t_final,
-        std::function<void(double)> on_step
-    );
-
+    // ── Acceso al árbol del último paso ─────────────────────────────────────
     const HierarchyNode* last_tree() const { return last_root.get(); }
 
-    bool pn_active_for(const std::vector<int>& indices) const;
-    int  pn_active_count() const;
+    // ── Acceso al merger engine (para configurar callbacks externos) ─────────
+    tidal::MergerEngine& merger_engine() { return merger_engine_; }
 
 private:
-    using TripleKey = std::tuple<int,int,int>;
 
-    static TripleKey make_triple_key(int i, int j, int k) {
-        int a = i, b = j, c = k;
-        if (a > b) std::swap(a, b);
-        if (b > c) std::swap(b, c);
-        if (a > b) std::swap(a, b);
-        return {a, b, c};
-    }
+    // ── Detección del modo directo ───────────────────────────────────────────
+    // Devuelve true si el árbol raíz es un único GROUP_AR_CHAIN con índices
+    // (out_indices). También acepta nodos TRIPLE_AR_CHAIN (alias).
+    bool is_pure_group_ar_chain(const HierarchyNode&  root,
+                                std::vector<int>&      out_indices) const;
 
-    // ── Despachadores ────────────────────────────────────────────────────────
+    // ── Despachador recursivo ────────────────────────────────────────────────
     void integrate_node(
-        HierarchyNode& node, NBodySystem& system, double dt,
-        std::vector<bool>& in_subsystem);
+        HierarchyNode&        node,
+        NBodySystem&          system,
+        double                dt,
+        std::vector<bool>&    in_subsystem
+    );
 
     void integrate_leaf(
-        HierarchyNode& node, NBodySystem& system, double dt,
-        std::vector<bool>& in_subsystem);
+        HierarchyNode&        node,
+        NBodySystem&          system,
+        double                dt,
+        std::vector<bool>&    in_subsystem
+    );
 
     void integrate_pair_ks(
-        HierarchyNode& node, NBodySystem& system, double dt);
+        HierarchyNode&  node,
+        NBodySystem&    system,
+        double          dt
+    );
 
     void integrate_triple_chain(
-        HierarchyNode& node, NBodySystem& system, double dt);
+        HierarchyNode&  node,
+        NBodySystem&    system,
+        double          dt
+    );
 
-    void integrate_triple_ar_chain(
-        HierarchyNode& node, NBodySystem& system, double dt);
-
-    // FASE 7A: N >= 2 cuerpos en GROUP_AR_CHAIN
     void integrate_group_ar_chain(
-        HierarchyNode& node, NBodySystem& system, double dt);
-
-    void integrate_pn_group(
-        HierarchyNode& node, NBodySystem& system, double dt);
+        HierarchyNode&  node,
+        NBodySystem&    system,
+        double          dt
+    );
 
     void integrate_composite(
-        HierarchyNode& node, NBodySystem& system, double dt,
-        std::vector<bool>& in_subsystem);
+        HierarchyNode&      node,
+        NBodySystem&        system,
+        double              dt,
+        std::vector<bool>&  in_subsystem
+    );
 
-    void collect_active_ar_keys(
-        const HierarchyNode& node, std::vector<TripleKey>& keys) const;
+    // ── Clave canónica para caché AR-chain ───────────────────────────────────
+    // Índices ordenados concatenados: "2_5_7" para {7,2,5}.
+    static std::string make_key(std::vector<int> indices) {
+        std::sort(indices.begin(), indices.end());
+        std::string key;
+        for (int i : indices) {
+            if (!key.empty()) key += '_';
+            key += std::to_string(i);
+        }
+        return key;
+    }
 
     // ── Miembros ─────────────────────────────────────────────────────────────
-    std::unique_ptr<Integrator>    far;
-    KSIntegrator                   ks_simple;
-    KSPerturbedIntegrator          ks_perturbed;
-    Chain3Integrator               chain3;
-    ARChain3Integrator             ar_chain_;
-    HierarchyBuilder               builder;
-    double                         tidal_threshold;
-    RegimeLogger*                  logger;
-    std::size_t                    step_counter = 0;
-    double                         dt_hint_;
+    std::unique_ptr<Integrator>   far;
+    KSIntegrator                  ks_simple;
+    KSPerturbedIntegrator         ks_perturbed;
+    Chain3Integrator              chain3;
+    ARChainNKSIntegrator          ar_chain_ks_;   // Fases 6B + 7A
+    HierarchyBuilder              builder;
+    double                        tidal_threshold;
+    RegimeLogger*                 logger;
+    std::size_t                   step_counter = 0;
+    double                        current_time_ = 0.0;  // tiempo físico acumulado
 
-    std::unique_ptr<HierarchyNode> last_root;
-    std::map<int, ARChain3State>   ar_chain_states_;
+    std::unique_ptr<HierarchyNode>           last_root;
+    std::map<std::string, ARChainNState>     ar_chain_n_states_;
 
-    // FASE 7A: integrador KS generalizado para GROUP_AR_CHAIN
-    ARChainNKSIntegrator                         ar_chain_ks_;
-    std::map<std::string, ARChainNState>         ar_chain_n_states_;
+    // Fase 7B — block timestep
+    bool               enable_block_ts_;
+    BlockTimestep      block_ts_;
 
-    // FASE 6A: integrador PN
-    std::unique_ptr<ARChainNPNBSIntegrator>      pn_integrator_;
-    std::map<std::string, ARChainNState>         pn_states_;
-    std::map<std::string, bool>                  pn_cache_;
-
-    // FASE 7B: block timestep (nullptr = desactivado)
-    std::unique_ptr<BlockTimestep>               block_ts_;
+    // Fase 7C — merger engine
+    bool               enable_mergers_;
+    tidal::MergerEngine merger_engine_;
 };
