@@ -25,6 +25,9 @@
 #include "../regularization/chain/archain_n_pn_bs_integrator.h"
 // FASE 7A
 #include "../regularization/chain/archain_n_ks_integrator.h"
+// FASE 7B
+#include "block_timestep.h"
+#include "leapfrog_integrator.h"
 
 class HierarchicalIntegrator : public Integrator {
 public:
@@ -33,7 +36,9 @@ public:
         double r_ks_threshold,
         double ks_internal_dt,
         const HierarchyBuilder::Params& builder_params = HierarchyBuilder::Params{},
-        RegimeLogger* logger = nullptr
+        RegimeLogger* logger = nullptr,
+        bool enable_block_ts = false,
+        const BlockTimestep::Params& bt_params = BlockTimestep::Params{}
     );
 
     void step(
@@ -126,4 +131,7 @@ private:
     std::unique_ptr<ARChainNPNBSIntegrator>      pn_integrator_;
     std::map<std::string, ARChainNState>         pn_states_;
     std::map<std::string, bool>                  pn_cache_;
+
+    // FASE 7B: block timestep (nullptr = desactivado)
+    std::unique_ptr<BlockTimestep>               block_ts_;
 };
