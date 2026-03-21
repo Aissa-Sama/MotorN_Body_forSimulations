@@ -1,7 +1,10 @@
 // regularization/hierarchy/hierarchy_builder.h
+// FASE 6A: Añadidos PNParams dentro de Params para activación automática de PN.
 #pragma once
 #include <vector>
 #include <tuple>
+#include <map>
+#include <string>
 #include <memory>
 #include "hierarchy_node.h"
 #include "nbody_system.h"
@@ -11,24 +14,20 @@
 //
 // Construye el árbol de jerarquía a partir del estado físico del sistema.
 //
-// Algoritmo (Mikkola & Aarseth):
-//   1. find_close_pairs()        → pares con r_ij < r_threshold
-//   2. filter_bound()            → pares con E_bind < 0
-//   3. find_triples()            → dos pares que comparten un cuerpo
-//   4. classify_triple()         → AR-chain si sep_min < umbral,
-//                                   KS-chain si acoplamiento moderado
-//   5. compute_tidal_parameter() → decide KS simple vs KS perturbado
-//   6. Construir árbol con los nodos resultantes
+// FASE 6A — ACTIVACIÓN AUTOMÁTICA DE PN:
+//   Cuando PNParams::enabled=true, build() marca pn_active=true en cualquier
+//   nodo cuya separación mínima cae bajo el umbral físico:
 //
-// DECISIÓN AR-chain vs KS-chain:
-//   sep_min < ar_chain_threshold → TRIPLE_AR_CHAIN
-//   sep_min ≥ ar_chain_threshold → TRIPLE_CHAIN
+//     r_PN = G · m_subgrupo / (ε_PN · c²)
 //
-//   Justificación del umbral 0.1:
-//     Experimentos numéricos (Nota Técnica Interna, Marzo 2026) muestran que
-//     KS-chain falla para sep_min < ~0.15. Un umbral de 0.1 activa AR-chain
-//     solo cuando el encuentro es genuinamente cercano, evitando el costo
-//     de AR-chain cuando KS-chain es suficiente.
+//   El HierarchicalIntegrator lee pn_active en cada nodo y selecciona
+//   ARChainNPNBSIntegrator cuando corresponde.
+//
+//   HISTERESIS: Para evitar flip-flopping cuando sep_min ~ r_PN, el builder
+//   usa un cache de histeresis (pasado desde el integrador):
+//     Activar:   sep_min <  r_PN
+//     Mantener:  sep_min <  2·r_PN  (si ya estaba activo)
+//     Desactivar: sep_min >= 2·r_PN
 // ============================================================================
 class HierarchyBuilder {
 public:
@@ -36,55 +35,74 @@ public:
     // PARÁMETROS DE CONSTRUCCIÓN
     // -----------------------------------------------------------------------
     struct Params {
-        double r_ks_threshold      = 1.0;  ///< Radio para pares cercanos
-        double tidal_threshold     = 0.1;  ///< ε < thr → KS simple; else → KS perturbado
-        double strong_coupling_eta = 3.0;  ///< r_3cm < eta * r_binary → triple fuerte
-
-        // Umbral para elegir AR-chain vs KS-chain en triples
-        // sep_min < ar_chain_threshold → AR-chain TTL (robusto para encuentros reales)
-        // sep_min ≥ ar_chain_threshold → KS-chain     (más rápido, separación moderada)
-        double ar_chain_threshold  = 0.5;  ///< u.a. — calibrado en experimentos (usado 0.1 anteriormente)
-
-        // Parámetro η del ARChain3Integrator: ds = η · sep_min / Ω
-        // η = 1e-3 → ~8k pasos/período, dE ~ 0.2 (rápido)
-        // η = 1e-4 → ~90k pasos/período, dE ~ 0.03 (preciso)
+        double r_ks_threshold      = 1.0;
+        double tidal_threshold     = 0.1;
+        double strong_coupling_eta = 3.0;
+        double ar_chain_threshold  = 0.5;
         double ar_chain_eta        = 1e-3;
+
+        // ── FASE 6A — Parámetros de activación PN ───────────────────────────
+        struct PNParams {
+            bool   enabled             = false;  ///< false → PN nunca se activa
+            double c_speed             = 1e4;    ///< Velocidad de la luz en unidades N-body
+            int    pn_order            = 1;      ///< Bitmask: 1=PN1, 2=PN2, 4=PN25, 7=todos
+            double activation_epsilon  = 1e-3;   ///< ε_PN: nivel de importancia relativa PN1
+            double hysteresis_factor   = 2.0;    ///< Mantener PN activo hasta sep > factor×r_PN
+            double bs_eps              = 1e-10;  ///< Tolerancia del GBS cuando PN activo
+            double eta_pn              = 1e-3;   ///< Parámetro η del integrador PN
+
+            /// Calcula el umbral de separación para el grupo con masa total m_total.
+            /// r_PN = m_total / (ε_PN · c²)   [G=1]
+            double r_pn_threshold(double m_total) const {
+                if (c_speed < 1e-30 || activation_epsilon < 1e-30) return 0.0;
+                return m_total / (activation_epsilon * c_speed * c_speed);
+            }
+        } pn;
+        // ────────────────────────────────────────────────────────────────────
     };
 
     explicit HierarchyBuilder(const Params& p = Params{}) : params(p) {}
 
     // -----------------------------------------------------------------------
     // INTERFAZ PRINCIPAL
+    //
+    // pn_cache: mapa de histeresis. La clave es la clave canónica del subgrupo
+    //   (índices ordenados, concatenados con '_'). El valor es true si el
+    //   subgrupo tenía PN activo en el paso anterior.
+    //   El HierarchicalIntegrator gestiona este mapa entre pasos.
     // -----------------------------------------------------------------------
 
-    /// Construye el árbol completo a partir del sistema.
-    std::unique_ptr<HierarchyNode> build(const NBodySystem& system) const;
+    /// Construye el árbol. pn_cache es lectura/escritura: read para histeresis,
+    /// write para actualizar el estado de activación de cada subgrupo.
+    std::unique_ptr<HierarchyNode> build(
+        const NBodySystem& system,
+        std::map<std::string, bool>* pn_cache = nullptr) const;
 
     // -----------------------------------------------------------------------
     // MÉTODOS PÚBLICOS (visibles para tests)
     // -----------------------------------------------------------------------
-
-    std::vector<std::pair<int,int>> find_close_pairs(
-        const NBodySystem& system) const;
-
-    double compute_binding_energy(
-        const NBodySystem& system, int i, int j) const;
-
-    double compute_tidal_parameter(
-        const NBodySystem& system, int i, int j) const;
-
-    std::vector<std::pair<int,int>> select_bound_pairs(
-        const NBodySystem& system) const;
-
+    std::vector<std::pair<int,int>> find_close_pairs(const NBodySystem& system) const;
+    double compute_binding_energy(const NBodySystem& system, int i, int j) const;
+    double compute_tidal_parameter(const NBodySystem& system, int i, int j) const;
+    std::vector<std::pair<int,int>> select_bound_pairs(const NBodySystem& system) const;
     std::vector<std::tuple<int,int,int>> find_triples(
         const std::vector<std::pair<int,int>>& pairs) const;
+    bool triple_is_strongly_coupled(const NBodySystem& system, int i, int j, int k) const;
+    double compute_sep_min(const NBodySystem& system, int i, int j, int k) const;
 
-    bool triple_is_strongly_coupled(
-        const NBodySystem& system, int i, int j, int k) const;
+    // ── FASE 6A: helpers de clave y umbral ──────────────────────────────────
 
-    /// Separación mínima entre los tres cuerpos del triple.
-    double compute_sep_min(
-        const NBodySystem& system, int i, int j, int k) const;
+    /// Genera la clave canónica de un subgrupo a partir de sus índices ordenados.
+    /// Ejemplo: índices {2, 0, 1} → "0_1_2"
+    static std::string make_group_key(std::vector<int> indices);
+
+    /// Decide si un subgrupo debe tener PN activo, considerando el cache de histeresis.
+    /// Lee pn_cache[key] para el estado previo; escribe el nuevo estado.
+    bool decide_pn_active(
+        const std::string& key,
+        double sep_min,
+        double m_total,
+        std::map<std::string, bool>* pn_cache) const;
 
 private:
     Params params;
